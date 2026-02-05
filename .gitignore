@@ -5,3 +5,5 @@ venv/
 
 dataset/
 *.npy
+
+test.py

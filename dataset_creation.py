@@ -15,6 +15,7 @@ if __name__ == "__main__":
 
     # Define Important Variables #
     trajectory_len = 80
+    buffer_size = trajectory_len // 2
 
     filename = "or-rbr_3"
 
@@ -22,7 +23,7 @@ if __name__ == "__main__":
     state_path = f"dataset/state/{filename}/"
     trajectory_path = f"dataset/trajectory/{filename}/"
 
-    cap = cv2.VideoCapture(0) # Change the index if you have multiple cameras
+    cap = cv2.VideoCapture(2) # Change the index if you have multiple cameras
 
     controller = DobotController(
         dashboard_ip="192.168.5.1",
@@ -59,8 +60,9 @@ if __name__ == "__main__":
                 cv2.imwrite(f"{image_path}{str(i)}.png", frame)
 
             # Cut Trajectory into Fragments
-            fragment = trajectory[points:points+trajectory_len]
-            print(f"Joints {trajectory[points:points+trajectory_len, :6].shape}, IO {trajectory[points:points+trajectory_len, 6].shape}")
+            trajectory_w_buffer = min(len(trajectory) - points, trajectory_len + buffer_size)
+            fragment = trajectory[points:points+trajectory_w_buffer]
+            print(f"Joints {trajectory[points:points+trajectory_w_buffer, :6].shape}, IO {trajectory[points:points+trajectory_w_buffer, 6].shape}")
 
             # Save Trajectory Fragment
             np.save(f"{trajectory_path}{str(i)}.npy", fragment)
@@ -75,6 +77,6 @@ if __name__ == "__main__":
 
             time.sleep(1) # Make sure Robot has stopped for clear image
 
-        # reset_position(controller)
+        reset_position(controller)
 
     controller.shutdown()

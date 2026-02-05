@@ -1,12 +1,18 @@
 import time
 from dobot_controller import DobotController
 
-def create_dataset(controller: DobotController, final_file: str = "null.npy"):
+def create_dataset(
+        controller: DobotController, 
+        record_duration: float = 5.0,
+        record_hz: float = 80.0,
+        threshold: float = 0.025,
+        final_file: str = "null.npy"
+):
 
     controller.record_trajectory(
-            record_duration=5.0,
-            record_hz=80.0,
-            threshold=0.025,
+            record_duration=record_duration,
+            record_hz=record_hz,
+            threshold=threshold,
             save_path="recorded_trajectory.npy"
     )
 
@@ -36,7 +42,7 @@ if __name__ == "__main__":
     if controller.robot_state.get('ready', False):
 
         create_dataset(controller, final_file="bl-flf_1.npy")
-        # reset_position(controller)
-        pass
+        time.time.sleep(1)
+        reset_position(controller)
 
     controller.shutdown()

@@ -3,6 +3,7 @@ import json
 import re
 import time
 import threading
+from queue import Queue
 
 import numpy as np
 
@@ -13,14 +14,16 @@ class DobotController:
     def __init__(
         self, 
         dashboard_ip="127.0.0.1", dashboard_port=29999, 
-        feedback_ip="127.0.0.1", feedback_port=30004
+        feedback_ip="127.0.0.1", feedback_port=30004,
+        home_joint=None, 
+        home_position=None
         ):
         self.client_dash = None
         self.client_feed = None
         self.robot_state = {}
 
-        self.home_joint = [90.0, 0.0, 130.0, -40.0, -90.0, 0.0]
-        self.home_position = [-647.06, 131.33, -303.88, 132.32, 0.32, 0.30]
+        self.home_joint = home_joint if home_joint is not None else [90.0, 0.0, 130.0, -40.0, -90.0, 0.0]
+        self.home_position = home_position if home_position is not None else [-647.06, 131.33, -303.88, 132.32, 0.32, 0.30]
 
         class item:
             def __init__(self):
@@ -71,7 +74,14 @@ class DobotController:
         self.robot_state['ready'] = False
 
     ## **** 
-    def move_trajectory_smooth(self, trajectory_points: np.ndarray, control_frequency: float = 80.0, threshold: float = 0.25, speed_scale: float = 1.0):
+    def move_trajectory_smooth(
+            self, 
+            trajectory_points: np.ndarray, 
+            control_frequency: float = 80.0, 
+            threshold: float = 0.25, 
+            speed_scale: float = 1.0,
+            queue: Queue = None
+        ):
         """
         Executes a trajectory by strictly following the path defined by the points.
         
@@ -80,6 +90,7 @@ class DobotController:
         - control_frequency: Frequency (Hz) at which to update the robot commands.
         - threshold: Distance threshold to consider the final position reached.
         - speed_scale: Scaling factor for maximum speed (0.0 to 1.0).
+        - queue: Optional Queue to check for new signal arrival.
         """
         if not self.client_dash or not self.robot_state.get('enable', False):
             print("Cannot move trajectory: client not initialized or robot not enabled.")
@@ -123,8 +134,22 @@ class DobotController:
         current_velocity = 0.0
         last_io_state = -1
 
+        # Variables for queue checking
+        curr_trajectory_index = 0
+        trajectory_queue_len = 0 if queue is None else queue.qsize()
+        stopping_flag = False
+
         # Iterate through the fixed absolute waypoints
         for i, (target_joints, target_io) in enumerate(absolute_waypoints):
+
+            curr_trajectory_index = i
+
+            # Check for new signal in the queue to stop execution
+            trajectory_queue_len_new = 0 if queue is None else queue.qsize()
+            if trajectory_queue_len_new > trajectory_queue_len:
+                stopping_flag = True
+                print("New trajectory signal received, stopping current trajectory.")
+                break
 
             is_last_point = (i == total_points - 1)
 
@@ -184,6 +209,9 @@ class DobotController:
                 if elapsed < delay_time:
                     time.sleep(delay_time - elapsed)
 
+        if stopping_flag:
+            return curr_trajectory_index
+
         # Ensure the PHYSICAL robot actually catches up to the final virtual point
         start_wait = time.time()
         while time.time() - start_wait < 0.5: # 0.5s timeout
@@ -195,6 +223,8 @@ class DobotController:
             # Keep holding the position
             self.client_dash.ServoJ(*final_target)
             time.sleep(delay_time)
+
+        return 0
 
     def move_trajectory_RelMovJ(self, trajectory_points: np.ndarray):
         """
@@ -476,6 +506,52 @@ class DobotController:
             self.client_dash.StopDrag()
             np.save(save_path, recorded_data)
             print(f"✅ Saved {len(recorded_data)} frames to {save_path}")
+
+    def inference(self, trajectory_queue: Queue[np.ndarray]):
+        """
+        Fucntion for inference robot steering with external model e.g. VLA or RL agent
+        """
+
+        blend_trajectory_points = None
+
+        starting_index = 0
+
+        while True:
+
+            # Check if there is trajectory points to process
+            if trajectory_queue.empty() and blend_trajectory_points is None:
+                time.sleep(0.01)
+                continue
+
+            if not trajectory_queue.empty() and blend_trajectory_points is None:
+                trajectory_points = trajectory_queue.get().copy()
+                blend_trajectory_points = trajectory_points.copy()
+
+            # Return the current index in the trajectory points before new signal arrives
+            starting_index = self.move_trajectory_smooth(
+                trajectory_points=blend_trajectory_points,
+                control_frequency=80.0,
+                queue=trajectory_queue
+            )
+            
+            # starting_index will < len(trajectory_points) - 1 if there is new signal in the queue
+            # we blend the remaining trajectory points with new trajectory points
+            if starting_index < len(trajectory_points) - 1 and not trajectory_queue.empty():
+                trajectory_points = trajectory_queue.get().copy()
+                temp_trajectory_points = trajectory_points.copy()
+
+                remaining_points = blend_trajectory_points[starting_index + 1:].copy()
+
+                temp_trajectory_points[:len(remaining_points)] = remaining_points
+                blend_trajectory_points = (trajectory_points + temp_trajectory_points) / 2
+            else:
+                blend_trajectory_points = None
+
+            # Add Stopping Condition Here
+            if trajectory_points.mean() == 0:
+                print("Inference Stopped.")
+                break
+
 
 def reset_position(controller: DobotController):
     time.sleep(1)
