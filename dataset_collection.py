@@ -5,7 +5,7 @@ def create_dataset(
         controller: DobotController, 
         record_duration: float = 5.0,
         record_hz: float = 80.0,
-        threshold: float = 0.025,
+        threshold: float = 0.05,
         final_file: str = "null.npy"
 ):
 
@@ -41,8 +41,8 @@ if __name__ == "__main__":
 
     if controller.robot_state.get('ready', False):
 
-        create_dataset(controller, final_file="bl-flf_1.npy")
-        time.time.sleep(1)
-        reset_position(controller)
+        create_dataset(controller, final_file="temp.npy", record_duration=4.5)
+        time.sleep(1)
+        #reset_position(controller)
 
     controller.shutdown()

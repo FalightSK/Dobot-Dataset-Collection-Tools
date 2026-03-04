@@ -4,6 +4,7 @@ __pycache__/
 venv/
 
 dataset/
+dataset_raw/
 *.npy
 
 test.py

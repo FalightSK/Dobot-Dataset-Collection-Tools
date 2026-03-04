@@ -14,16 +14,26 @@ def reset_position(controller: DobotController):
 if __name__ == "__main__":
 
     # Define Important Variables #
-    trajectory_len = 80
+    save = True
+
+    trajectory_len = 40
     buffer_size = trajectory_len // 2
 
-    filename = "or-rbr_3"
+    cate= "free"
+    raw_path = f"./dataset_raw/{cate}/6/"
+    filename = "up_to_yellow_f_blue_6"
 
-    image_path = f"dataset/image/{filename}/"
-    state_path = f"dataset/state/{filename}/"
-    trajectory_path = f"dataset/trajectory/{filename}/"
+    image_path = f"dataset/image/{filename}_{cate}/"
+    state_path = f"dataset/state/{filename}_{cate}/"
+    trajectory_path = f"dataset/trajectory/{filename}_{cate}/"
 
-    cap = cv2.VideoCapture(2) # Change the index if you have multiple cameras
+    cam_url = r"http://192.168.137.21:81/stream"
+    overview = cv2.VideoCapture(1) # Change the index if you have multiple cameras
+    endview = cv2.VideoCapture(cam_url)
+    _, frame = overview.read()
+    del frame
+    _, frame = endview.read()
+    del frame
 
     controller = DobotController(
         dashboard_ip="192.168.5.1",
@@ -41,7 +51,7 @@ if __name__ == "__main__":
         os.makedirs(trajectory_path, exist_ok=True)
 
         # Load Trajectory from File created by `dataset_collection.py`
-        trajectory = np.load(f"{filename}.npy")
+        trajectory = np.load(f"{raw_path}{filename}.npy")
         print(f"Trajectory shape: {trajectory.shape}")
 
         # Loop through Trajectory in Segments to save the Robot State, IO State and Environment Image
@@ -50,33 +60,51 @@ if __name__ == "__main__":
 
             # Save Robot and IO State Before Movement
             robot_state = np.array(controller.feedData.Qactual)
-            io_state = np.array(controller.feedData.DigitalOutputs)
+            io_state = np.array([controller.feedData.DigitalOutputs])
             combined_state = np.concatenate((robot_state, io_state), axis=0)
-            np.save(f"{state_path}{str(i)}.npy", combined_state)
+            if save:
+                np.save(f"{state_path}{str(i)}.npy", combined_state)
 
             # Save Environment Image
-            ret, frame = cap.read()
-            if ret:
-                cv2.imwrite(f"{image_path}{str(i)}.png", frame)
+            if save:
+                ret_1, frame_1 = endview.read()
+                for j in range(3):
+                    ret_1, frame_1 = endview.read()
+                    if not ret_1:
+                        print("Failed to capture end view image, retrying...")
+                        endview.release()
+                        endview = cv2.VideoCapture(cam_url)
+                        time.sleep(0.25)
+                ret, frame = overview.read()
+                print("Saving Image...")
+                if ret:
+                    cv2.imwrite(f"{image_path}{str(i)}.png", frame)
+                if ret_1:
+                    cv2.imwrite(f"{image_path}{str(i)}_end.png", frame_1)
+                print("Done with file path: ", f"{image_path}{str(i)}.png")
+                
 
             # Cut Trajectory into Fragments
             trajectory_w_buffer = min(len(trajectory) - points, trajectory_len + buffer_size)
             fragment = trajectory[points:points+trajectory_w_buffer]
+            steering_fragment = trajectory[points:points+trajectory_len]
             print(f"Joints {trajectory[points:points+trajectory_w_buffer, :6].shape}, IO {trajectory[points:points+trajectory_w_buffer, 6].shape}")
 
-            # Save Trajectory Fragment
-            np.save(f"{trajectory_path}{str(i)}.npy", fragment)
+            if save:
+                # Save Trajectory Fragment
+                np.save(f"{trajectory_path}{str(i)}.npy", fragment)
 
             # Move Robot along Trajectory Fragment
             controller.move_trajectory_smooth(
-                trajectory_points=fragment,
+                trajectory_points=steering_fragment,
                 control_frequency=80.0,
-                threshold=0.25,
-                speed_scale=1.0
+                threshold=0.5,
+                speed_scale=0.5
             )
 
-            time.sleep(1) # Make sure Robot has stopped for clear image
+            if save:
+                time.sleep(1) # Make sure Robot has stopped for clear image
 
-        reset_position(controller)
+        # reset_position(controller)
 
     controller.shutdown()

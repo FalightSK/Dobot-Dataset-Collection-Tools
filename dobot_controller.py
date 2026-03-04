@@ -23,7 +23,7 @@ class DobotController:
         self.robot_state = {}
 
         self.home_joint = home_joint if home_joint is not None else [90.0, 0.0, 130.0, -40.0, -90.0, 0.0]
-        self.home_position = home_position if home_position is not None else [-647.06, 131.33, -303.88, 132.32, 0.32, 0.30]
+        self.home_position = home_position if home_position is not None else [144.348, -387.83, 240.45, -179.884, -0.0137, -179.565]
 
         class item:
             def __init__(self):
@@ -213,13 +213,170 @@ class DobotController:
             return curr_trajectory_index
 
         # Ensure the PHYSICAL robot actually catches up to the final virtual point
+        # This make robot unstable due to noise from feedback
+        # We have to ensure that robot actually stop when trajectory ends
         start_wait = time.time()
         while time.time() - start_wait < 0.5: # 0.5s timeout
             real_pos = np.array(self.feedData.Qactual)
             # Check error between Real Robot and Final Waypoint
             final_target = absolute_waypoints[-1][0]
+            if np.max(np.abs(final_target - real_pos)) < threshold or trajectory_points.mean() == 0:
+                break
+            # Keep holding the position
+            self.client_dash.ServoJ(*final_target)
+            time.sleep(delay_time)
+
+        return 0
+
+    def move_trajectory_smooth_absolute(
+            self, 
+            trajectory_points: np.ndarray, 
+            control_frequency: float = 80.0, 
+            threshold: float = 0.25, 
+            speed_scale: float = 1.0,
+            queue: Queue = None
+        ):
+        """
+        Executes a trajectory by strictly following the path defined by the points.
+        
+        Parameters:
+        - trajectory_points: np.ndarray of shape (N, 7) where [:6] is ABSOLUTE joint positions and [6] is IO state.
+        - control_frequency: Frequency (Hz) at which to update the robot commands.
+        - threshold: Distance threshold to consider the final position reached.
+        - speed_scale: Scaling factor for maximum speed (0.0 to 1.0).
+        - queue: Optional Queue to check for new signal arrival.
+        """
+        if not self.client_dash or not self.robot_state.get('enable', False):
+            print("Cannot move trajectory: client not initialized or robot not enabled.")
+            return
+
+        delay_time = 1.0 / control_frequency
+
+        # Max Speed: 1.0 deg/loop @ 80Hz = 80 deg/s
+        MAX_VELOCITY = 1.0 * speed_scale
+        # Acceleration: Lower = Smoother, Higher = More precise corners
+        ACCEL = 0.05 
+
+        # We grab the current physical location to start the virtual governor
+        current_real_joints = np.array(self.feedData.Qactual)
+
+        # This list will hold [J1, J2, J3, J4, J5, J6, IO_State] for every waypoint
+        absolute_waypoints = []
+
+        # Create absolute waypoints directly from the input
+        for point in trajectory_points:
+            if len(point) < 6: continue
+
+            # Because input is ALREADY absolute, we just copy it
+            abs_joints = np.array(point[:6])
+            
+            # Saving IO state if provided            
+            io = int(point[6]) if len(point) > 6 else -1
+            
+            # Store the absolute trajectory
+            absolute_waypoints.append((abs_joints, io))
+
+        total_points = len(absolute_waypoints)
+        if total_points == 0:
+            return 0
+            
+        print(f"Absolute Path Locked: {total_points} waypoints.")
+
+        # The 'virtual_joints' starts at the robot's current position
+        # It will draw a smooth line from where the robot IS to the FIRST absolute point
+        virtual_joints = np.copy(current_real_joints)
+        current_velocity = 0.0
+        last_io_state = -1
+
+        # Variables for queue checking
+        curr_trajectory_index = 0
+        trajectory_queue_len = 0 if queue is None else queue.qsize()
+        stopping_flag = False
+
+        # Iterate through the fixed absolute waypoints
+        for i, (target_joints, target_io) in enumerate(absolute_waypoints):
+
+            curr_trajectory_index = i
+
+            # Check for new signal in the queue to stop execution
+            trajectory_queue_len_new = 0 if queue is None else queue.qsize()
+            if trajectory_queue_len_new > trajectory_queue_len:
+                stopping_flag = True
+                print("New trajectory signal received, stopping current trajectory.")
+                break
+
+            is_last_point = (i == total_points - 1)
+
+            # Calculate full distance of this specific segment
+            segment_vector = target_joints - virtual_joints
+            segment_total_dist = np.max(np.abs(segment_vector))
+            
+            # If segment is tiny, just skip to next to avoid divide-by-zero errors
+            if segment_total_dist < 0.001:
+                continue
+
+            while True:
+                loop_start = time.perf_counter()
+
+                # Calculate distance from VIRTUAL point to TARGET waypoint
+                error_vector = target_joints - virtual_joints
+                dist_to_target = np.max(np.abs(error_vector))
+
+                # Check if Virtual Point has reached the target
+                # STRICTNESS: We use a very small tolerance (0.05) for the virtual point
+                # so it essentially hits the exact coordinate.
+                if dist_to_target < 0.05:
+                    # Snap exactly to target to prevent float drift
+                    virtual_joints = np.copy(target_joints)
+                    break
+                
+                # Decelerate ONLY if it's the very last point
+                if is_last_point:
+                    # Braking distance logic
+                    max_reachable_vel = np.sqrt(2 * ACCEL * dist_to_target) 
+                    target_vel = min(MAX_VELOCITY, max_reachable_vel)
+                    target_vel = max(target_vel, 0.05) # Minimum creep speed
+                else:
+                    # Cruise speed for intermediate points
+                    target_vel = MAX_VELOCITY
+
+                # Ramp Velocity
+                if current_velocity < target_vel:
+                    current_velocity += ACCEL
+                elif current_velocity > target_vel:
+                    current_velocity -= ACCEL
+
+                # Clip velocity so we don't overshoot the target in 1 step
+                step_magnitude = min(current_velocity, dist_to_target)
+
+                # Normalize vector to get direction
+                direction = error_vector / dist_to_target
+                step_vector = direction * step_magnitude
+
+                virtual_joints += step_vector
+                self.client_dash.ServoJ(*virtual_joints)
+
+                if target_io != -1 and target_io != last_io_state:
+                    self.client_dash.ToolDOInstant(0, target_io)
+                    last_io_state = target_io
+
+                elapsed = time.perf_counter() - loop_start
+                if elapsed < delay_time:
+                    time.sleep(delay_time - elapsed)
+
+        if stopping_flag:
+            return curr_trajectory_index
+
+        # Ensure the PHYSICAL robot actually catches up to the final virtual point
+        start_wait = time.time()
+        while time.time() - start_wait < 0.5: # 0.5s timeout
+            real_pos = np.array(self.feedData.Qactual)
+            final_target = absolute_waypoints[-1][0]
+            
+            # Only use the threshold check for absolute coordinates
             if np.max(np.abs(final_target - real_pos)) < threshold:
                 break
+                
             # Keep holding the position
             self.client_dash.ServoJ(*final_target)
             time.sleep(delay_time)
@@ -381,7 +538,7 @@ class DobotController:
         if data.shape[0] < 2:
             print("Trajectory too short to process.")
             return
-        
+
         # Calculate difference between current row [1:] and previous row [:-1]
         diffs = np.abs(data[1:] - data[:-1])
 
@@ -401,7 +558,22 @@ class DobotController:
         else:
             should_remove = is_duplicate & is_static_movement & is_io_stable
             mask_to_keep = ~should_remove
-        
+
+        # --- NEW: Preserve Trailing Zeros ---
+        # Find the index of the last frame we intend to KEEP based on the logic above.
+        valid_indices = np.where(mask_to_keep)[0]
+
+        if len(valid_indices) > 0:
+            last_valid_index = valid_indices[-1]
+            # Force 'True' (Keep) for everything after the last valid movement.
+            # This ensures the tail end of the recording is preserved exactly as recorded.
+            mask_to_keep[last_valid_index + 1:] = True
+        else:
+            # If the whole trajectory was marked for removal (e.g., robot never moved),
+            # we decide to keep everything to avoid deleting the file content.
+            mask_to_keep[:] = True
+        # ------------------------------------
+
         final_mask = np.concatenate(([True], mask_to_keep))
 
         cleaned_data = data[final_mask]
@@ -436,7 +608,6 @@ class DobotController:
         print("Move the robot now!")
 
         self.client_dash.StartDrag()
-        time.sleep(0.5)
 
         period = 1.0 / record_hz
         last_stable_joints = np.array(self.feedData.Qactual)
@@ -570,22 +741,24 @@ if __name__ == "__main__":
 
     if controller.robot_state.get('ready', False):
 
-        reset_position(controller)
+        # reset_position(controller)
 
-        trajectory = np.array([
-            [5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1],
-            [-10, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
-        ])
+        initial_position = np.load("./dataset/state/blue_to_red_2_push/0.npy")
+        print(initial_position)
 
-        controller.move_trajectory_smooth(
-            trajectory_points=trajectory,
+        trajectory = np.load("./dataset/ab_trajectory/blue_to_red_2_push/11.npy")
+        print(trajectory.shape)
+        
+        controller.move_trajectory_smooth_absolute(
+            trajectory_points=trajectory[:40, :],
             control_frequency=40.0,
             threshold=0.25,
-            speed_scale=0.25
+            speed_scale=0.15
         )
-
-        time.sleep(1)
-
-        reset_position(controller)
-
+        
+        # 
+        # time.sleep(1)
+        # 
+        # reset_position(controller)
+        # 
     controller.shutdown()
